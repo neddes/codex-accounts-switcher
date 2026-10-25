@@ -20,6 +20,14 @@ import Security
         try require(deviceLoginCode(from: "Code: \u{1B}[94mABCD-12345\u{1B}[0m") == "ABCD-12345", "ANSI device code")
         try require(deviceLoginCode(from: "\u{1B}[94mABCD-") == nil, "incomplete device code")
         try require(deviceLoginCode(from: "Starting sign-in") == nil, "no device code")
+        let home = URL(fileURLWithPath: "/Users/test/.codex")
+        let standalone = "/Users/test/.codex/packages/standalone/releases/0.164.0-aarch64-apple-darwin/bin/codex"
+        try require(isStandaloneAppServerDaemon(path: standalone, args: standalone + " app-server --listen unix:// --managed-daemon", codexHome: home), "managed app-server daemon")
+        try require(isStandaloneAppServerDaemon(path: standalone, args: standalone + " app-server daemon pid-update-loop", codexHome: home), "app-server daemon supervisor")
+        try require(!isStandaloneAppServerDaemon(path: standalone, args: "codex exec -m model -", codexHome: home), "terminal codex exec is not a daemon")
+        try require(!isStandaloneAppServerDaemon(path: standalone, args: "codex", codexHome: home), "interactive codex is not a daemon")
+        try require(!isStandaloneAppServerDaemon(path: standalone, args: "codex app-server --listen stdio://", codexHome: home), "manual app-server is not a daemon")
+        try require(!isStandaloneAppServerDaemon(path: "/opt/homebrew/bin/codex", args: "codex app-server --managed-daemon", codexHome: home), "daemon outside CODEX_HOME")
         let now = Date(timeIntervalSince1970: 1000000)
         let mid = WeeklyPace.calculate(remaining: 60, reset: now.addingTimeInterval(302400), now: now)!
         try require(mid.expectedUsed == 50 && !mid.overPace, "midweek pace")

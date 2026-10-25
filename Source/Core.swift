@@ -207,6 +207,15 @@ func deviceLoginCode(from output: String) -> String? {
     guard let match = plain.range(of: "\\b[A-Z0-9]{4,6}-[A-Z0-9]{4,6}\\b", options: .regularExpression) else { return nil }
     return String(plain[match])
 }
+// The standalone CLI's managed app-server daemon (`codex app-server --managed-daemon` and its
+// `codex app-server daemon ...` supervisor) runs the same binary as a user's terminal `codex`,
+// so it is recognized by its arguments, not just its path.
+func isStandaloneAppServerDaemon(path: String, args: String, codexHome: URL) -> Bool {
+    guard path.hasPrefix(codexHome.appendingPathComponent("packages/standalone").path + "/") else { return false }
+    let words = args.split(whereSeparator: \.isWhitespace).map(String.init)
+    guard let sub = words.firstIndex(of: "app-server") else { return false }
+    return words.contains("--managed-daemon") || words.dropFirst(sub + 1).first == "daemon"
+}
 
 struct WeeklyPace {
     let used: Double

@@ -245,23 +245,72 @@ import Combine
             try vault.save(next); state = next; profiles = next.profiles; message = "Saved account removed."
         } catch { message = error.localizedDescription }
     }
-    private func codexProcesses() throws -> Bool {
-        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/ps"); p.arguments = ["-axo", "comm="]
+    private func runningCodexProcesses() throws -> [(pid: Int32, path: String, args: String)] {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/ps"); p.arguments = ["-axo", "pid=,comm="]
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
         try p.run()
         let output = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
         guard p.terminationStatus == 0 else { throw AppFailure("Cannot check for running Codex processes.") }
-        return String(decoding: output, as: UTF8.self).components(separatedBy: .newlines).contains {
-            let name = URL(fileURLWithPath: $0.trimmingCharacters(in: .whitespaces)).lastPathComponent
-            return name == "codex" || name == "codex-cli"
+        var result: [(pid: Int32, path: String, args: String)] = []
+        for rawLine in String(decoding: output, as: UTF8.self).components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard let sep = line.firstIndex(of: " "), let pid = Int32(line[line.startIndex..<sep]) else { continue }
+            let path = line[line.index(after: sep)...].trimmingCharacters(in: .whitespaces)
+            let name = URL(fileURLWithPath: path).lastPathComponent
+            if name == "codex" || name == "codex-cli" { result.append((pid, path, "")) }
         }
+        guard !result.isEmpty else { return result }
+        // Arguments are read separately: comm paths can contain spaces, so the two can't share one ps line.
+        let a = Process(); a.executableURL = URL(fileURLWithPath: "/bin/ps")
+        a.arguments = ["-o", "pid=,args=", "-p", result.map { String($0.pid) }.joined(separator: ",")]
+        let argsPipe = Pipe(); a.standardOutput = argsPipe; a.standardError = FileHandle.nullDevice
+        try a.run()
+        let argsOutput = argsPipe.fileHandleForReading.readDataToEndOfFile(); a.waitUntilExit()
+        var argsByPid: [Int32: String] = [:]
+        for rawLine in String(decoding: argsOutput, as: UTF8.self).components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard let sep = line.firstIndex(of: " "), let pid = Int32(line[line.startIndex..<sep]) else { continue }
+            argsByPid[pid] = line[line.index(after: sep)...].trimmingCharacters(in: .whitespaces)
+        }
+        return result.map { ($0.pid, $0.path, argsByPid[$0.pid] ?? "") }
+    }
+    // Codex's own background helpers - the plugin app-server that the ChatGPT browser
+    // extension and similar plugin hosts spawn under CODEX_HOME/plugins/.plugin-appserver
+    // (their exact layout inside that directory has changed over time, e.g. moving from a
+    // flat binary to a nested CodexCLI.app bundle, so match by directory prefix rather than
+    // an exact/allow-listed path), the standalone CLI's managed app-server daemon (see
+    // isStandaloneAppServerDaemon), plus the app's own embedded CLI - are not user-visible
+    // CLI/IDE sessions. They restart on demand and pick up the new login, so it's safe for
+    // the switch to signal them directly instead of waiting on them indefinitely. Everything
+    // else (a terminal `codex` session, the VS Code extension's bundled codex, etc.) is left
+    // alone; the user closes those themselves.
+    private func isCodexOwnedHelper(_ process: (pid: Int32, path: String, args: String)) -> Bool {
+        if let cli = cliURL, process.path == cli.path { return true }
+        let appserverPrefix = auth.home.appendingPathComponent("plugins/.plugin-appserver").path + "/"
+        return process.path.hasPrefix(appserverPrefix) || isStandaloneAppServerDaemon(path: process.path, args: process.args, codexHome: auth.home)
     }
     private func stopCodex() async throws {
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex")
         for app in running { _ = app.terminate() }
-        for _ in 0..<120 {
-            if NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex").isEmpty, try !codexProcesses() { return }
+        var termSentAt: [Int32: Int] = [:]
+        for iteration in 0..<120 {
+            let appStillOpen = !NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex").isEmpty
+            let processes = try runningCodexProcesses()
+            if !appStillOpen && processes.isEmpty { return }
+            for process in processes where isCodexOwnedHelper(process) {
+                if let sentAt = termSentAt[process.pid] {
+                    if iteration - sentAt >= 8 { kill(process.pid, SIGKILL) }
+                } else {
+                    kill(process.pid, SIGTERM)
+                    termSentAt[process.pid] = iteration
+                }
+            }
             try await Task.sleep(nanoseconds: 250_000_000)
+        }
+        let blockers = ((try? runningCodexProcesses()) ?? []).filter { !isCodexOwnedHelper($0) }
+        if !blockers.isEmpty {
+            let names = blockers.map { "\(URL(fileURLWithPath: $0.path).lastPathComponent) (pid \($0.pid)) at \($0.path)" }.joined(separator: "; ")
+            throw AppFailure("Codex did not fully stop. Close its quit dialog and any Codex CLI or IDE sessions, then try again. Still running: \(names). No login was replaced.")
         }
         throw AppFailure("Codex did not fully stop. Close its quit dialog and any Codex CLI or IDE sessions, then try again. No login was replaced.")
     }
